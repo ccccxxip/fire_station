@@ -1,112 +1,169 @@
-import csv
+from itertools import combinations
 import math
-import os
-from pulp import LpProblem, LpMinimize, LpVariable, lpSum, LpStatus, value
+import pandas as pd
 
-# --- 1. Чтение данных из CSV файлов ---
-# Файлы лежат в папке data
+# =====================================================================
+# 1. ЗАГРУЗКА И ПОДГОТОВКА ДАННЫХ ИЗ ФАЙЛОВ
+# =====================================================================
+hubs_df = pd.read_csv("data/hubs.csv")
+locs_df = pd.read_csv("data/locations.csv")
+params_df = pd.read_csv("data/parameters.csv")
 
-DATA_DIR = 'data'
+# Преобразуем таблицу параметров в удобный словарь
+params = dict(zip(params_df["parameter"], params_df["value"]))
 
-def read_csv(filename):
-    filepath = os.path.join(DATA_DIR, filename)
-    with open(filepath, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        return list(reader)
+BUDGET_LIMIT = float(params.get("budget", 60.0))  # Бюджет на станцию (млн руб.)
+AVG_SPEED_KMH = float(params.get("avg_speed", 50.0))  # Скорость (км/ч)
+SETUP_TIME_MIN = float(params.get("setup_time", 2.0))  # Время сбора (мин)
+POP_GROWTH = float(params.get("population_growth", 15.0)) / 100.0  # Рост 15%
 
-locations_data = read_csv('locations.csv')
-hubs_data = read_csv('hubs.csv')
-params_data = read_csv('parameters.csv')
+# Коэффициенты весов приоритетов районов
+PRIORITY_WEIGHTS = {"critical": 3.0, "high": 2.0, "medium": 1.5, "low": 1.0}
 
-# Парсинг параметров
-params = {row['parameter']: float(row['value']) for row in params_data}
-BUDGET_LIMIT = params['budget']
-AVG_SPEED = params['avg_speed']
-SETUP_TIME = params['setup_time']
-K = int(params['k'])
+# Флаг учета времени сбора (2 мин):
+# True - с учетом выезда из депо; False - чистое время движения по слайду
+USE_SETUP_TIME = False
 
-# Формирование словарей хабов и локаций
-hubs = {}
-for row in hubs_data:
-    hub_id = f"H{row['hub_id']}"
-    hubs[hub_id] = {
-        "x": float(row['x_coord']),
-        "y": float(row['y_coord']),
-        "population": int(row['population']),
-        "max_time": float(row['T_max']),
-        "priority": row['priority'],
-        "district": row['district_name']
-    }
+# =====================================================================
+# 2. ФИЛЬТРАЦИЯ ПЛОЩАДОК ПО БЮДЖЕТУ И СТАТУСУ
+# =====================================================================
+valid_locs = locs_df[
+    (locs_df["status"] == "available") & (locs_df["cost_mln"] <= BUDGET_LIMIT)
+].copy()
 
-sites = {}
-for row in locations_data:
-    site_id = f"S{row['loc_id']}"
-    sites[site_id] = {
-        "x": float(row['x_coord']),
-        "y": float(row['y_coord']),
-        "cost": float(row['cost_mln']),
-        "status": row['status'],
-        "water_supply": row['water_supply'],
-        "road_access": row['road_access'],
-        "address": row['address']
-    }
+rejected_locs = locs_df[~locs_df["loc_id"].isin(valid_locs["loc_id"])]
 
-# --- 2. Расчет матрицы времени в пути ---
+print("=" * 80)
+print("АНАЛИЗ ДОСТУПНОСТИ ПЛОЩАДОК ДЛЯ СТРОИТЕЛЬСТВА")
+print("=" * 80)
+print(f"Всего локаций в базе: {len(locs_df)}")
+print(f"Допущено к оптимизации: {len(valid_locs)}")
+for _, r in rejected_locs.iterrows():
+    reason = (
+        f"Статус '{r['status']}'"
+        if r["status"] != "available"
+        else f"Превышен бюджет ({r['cost_mln']} > {BUDGET_LIMIT} млн)"
+    )
+    print(f"  - Исключена площадка {r['loc_id']} ({r['address']}): {reason}")
+print()
+
+# =====================================================================
+# 3. ПОСТРОЕНИЕ МАТРИЦЫ ВРЕМЕНИ T_im (МИНУТЫ)
+# =====================================================================
+speed_km_min = AVG_SPEED_KMH / 60.0  # км/мин (50 / 60 ≈ 0.833)
+
 travel_time = {}
-for s_id, s_data in sites.items():
-    travel_time[s_id] = {}
-    for h_id, h_data in hubs.items():
-        distance_km = math.sqrt((s_data['x'] - h_data['x'])**2 + (s_data['y'] - h_data['y'])**2)
-        time_min = (distance_km / AVG_SPEED) * 60 + SETUP_TIME
-        travel_time[s_id][h_id] = round(time_min, 2)
+for _, loc in valid_locs.iterrows():
+    loc_id = int(loc["loc_id"])
+    travel_time[loc_id] = {}
+    for _, hub in hubs_df.iterrows():
+        hub_id = int(hub["hub_id"])
+        # Евклидово расстояние между хабом и площадкой
+        dist = math.hypot(
+            hub["x_coord"] - loc["x_coord"], hub["y_coord"] - loc["y_coord"]
+        )
+        # Время доезда: время сбора + расстояние / скорость
+        t = (SETUP_TIME_MIN if USE_SETUP_TIME else 0.0) + (dist / speed_km_min)
+        travel_time[loc_id][hub_id] = round(t, 2)
 
-# --- 3. Построение модели PuLP ---
-model = LpProblem("Fire_Station_Optimization", LpMinimize)
 
-z = {s_id: LpVariable(f"z_{s_id}", cat="Binary") for s_id in sites}
+# =====================================================================
+# 4. ИТЕРАЦИОННЫЙ ПОИСК МИНИМАЛЬНОГО ЧИСЛА СТАНЦИЙ (k-step)
+# =====================================================================
+def solve_fire_station_placement():
+    available_loc_ids = list(travel_time.keys())
+    max_possible_k = len(available_loc_ids)
 
-# Целевая функция: минимизация взвешенного времени
-model += lpSum(
-    travel_time[s][h] * hubs[h]["population"] * z[s]
-    for s in sites for h in hubs
-), "Total_Weighted_Response_Time"
+    print("=" * 80)
+    print(f"ЗАПУСК ОПТИМИЗАЦИОННОГО ПОИСКА (РЕЖИМ SETUP_TIME: {USE_SETUP_TIME})")
+    print("=" * 80)
 
-# Ограничение 1: Бюджет
-model += lpSum(sites[s]["cost"] * z[s] for s in sites) <= BUDGET_LIMIT, "Budget_Constraint"
+    for k in range(1, max_possible_k + 1):
+        best_combo = None
+        best_score = float("inf")
+        best_assignment = {}
 
-# Ограничение 2: Максимальное время прибытия для каждого хаба
-for h_id, h_data in hubs.items():
-    model += lpSum(
-        travel_time[s][h_id] * z[s] for s in sites
-    ) <= h_data["max_time"], f"MaxTime_{h_id}"
+        # Перебор всех сочетаний из M доступных по k станций
+        for combo in combinations(available_loc_ids, k):
+            feasible = True
+            combo_score = 0
+            current_assignment = {}
 
-# Ограничение 3: Только доступные локации
-for s_id, s_data in sites.items():
-    if s_data['status'] != 'available':
-        model += z[s_id] == 0, f"Unavailable_{s_id}"
+            for _, hub in hubs_df.iterrows():
+                hub_id = int(hub["hub_id"])
+                t_max = float(hub["T_max"])
+                pop = float(hub["population"]) * (1.0 + POP_GROWTH)
+                weight = PRIORITY_WEIGHTS.get(hub["priority"], 1.0)
 
-# Ограничение 4: Ровно K станций
-model += lpSum(z[s] for s in sites) == K, "Exact_Stations_Count"
+                # Выбираем станцию из combo, которая ближе всего к данному хабу
+                best_t_for_hub = min(travel_time[loc_id][hub_id] for loc_id in combo)
+                best_station = min(
+                    combo, key=lambda loc_id: travel_time[loc_id][hub_id]
+                )
 
-# --- 4. Решение и вывод результатов ---
-model.solve()
+                # Проверка соблюдения норматива времени безопасности
+                if best_t_for_hub > t_max:
+                    feasible = False
+                    break
 
-print(f"\nСтатус решения: {LpStatus[model.status]}")
+                current_assignment[hub_id] = {
+                    "hub_name": hub["district_name"],
+                    "station_id": best_station,
+                    "arrival_time": best_t_for_hub,
+                    "t_max": t_max,
+                    "priority": hub["priority"],
+                }
+                # Взвешенное время: время * население * приоритет
+                combo_score += best_t_for_hub * pop * weight
 
-if model.status == 1:
-    print(f"Общее взвешенное время: {value(model.objective)}")
-    total_cost = sum(sites[s]['cost'] * z[s].varValue for s in sites)
-    print(f"Затраченный бюджет: {total_cost} млн руб.")
-    
-    print("\nРекомендуемые станции к строительству:")
-    for s_id in sites:
-        if z[s_id].varValue == 1:
-            print(f"  ✅ {s_id} | Адрес: {sites[s_id]['address']} | "
-                  f"Стоимость: {sites[s_id]['cost']} млн | "
-                  f"Дороги: {sites[s_id]['road_access']} | Вода: {sites[s_id]['water_supply']}")
-    
-    print(f"\nИтого затрачено: {total_cost} / {BUDGET_LIMIT} млн руб.")
-else:
-    print("️ Оптимальное решение не найдено!")
-    print("При K=1 невозможно выбрать одну станцию, которая покроет все хабы в пределах T_max.")
-    print("Попробуйте увеличить K до 2 или 3 в файле parameters.csv")
+            if feasible and combo_score < best_score:
+                best_score = combo_score
+                best_combo = combo
+                best_assignment = current_assignment
+
+        # Вывод статуса текущей итерации k
+        if best_combo is not None:
+            print(f"-> [k = {k}]: НАЙДЕНО ДОПУСТИМОЕ РЕШЕНИЕ СО 100% ПОКРЫТИЕМ!\n")
+            print("=" * 80)
+            print("ИТОГОВЫЙ ПЛАН РАЗМЕЩЕНИЯ ПОЖАРНЫХ СТАНЦИЙ")
+            print("=" * 80)
+            print(f"Необходимое количество станций: {k}")
+            print(f"Минимальное взвешенное время: {best_score:,.2f}")
+            print("\nВыбранные площадки под строительство:")
+            for loc_id in best_combo:
+                row = valid_locs[valid_locs["loc_id"] == loc_id].iloc[0]
+                print(
+                    f"  * Площадка #{loc_id} ({row['address']}): "
+                    f"Стоимость = {row['cost_mln']} млн руб. | "
+                    f"Водоснабжение: {row['water_supply']} | "
+                    f"Подъезд: {row['road_access']}"
+                )
+
+            print("\nЗакрепление районов города за станциями:")
+            print("-" * 80)
+            print(
+                f"{'Хаб ID':<7}{'Район города':<25}{'Станция':<12}"
+                f"{'Время (мин)':<14}{'Норматив':<10}{'Статус':<8}"
+            )
+            print("-" * 80)
+            for hub_id, info in best_assignment.items():
+                print(
+                    f"{hub_id:<7}{info['hub_name']:<25}№{info['station_id']:<11}"
+                    f"{info['arrival_time']:<14.2f}{info['t_max']:<10.1f}OK"
+                )
+            print("-" * 80)
+            return
+
+        else:
+            print(
+                f"-> [k = {k}]: Невозможно покрыть все районы за норматив T_max. "
+                "Увеличиваем k..."
+            )
+
+    print(
+        "\nВнимание: При текущих жестких ограничениях полное покрытие невозможно."
+    )
+
+
+if __name__ == "__main__":
+    solve_fire_station_placement()
